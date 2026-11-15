@@ -9,8 +9,10 @@
    cursor observation through its read-only facade, and standalone/Workbench
    profiles carry an exact opaque consumer selector with current position,
    backlog, and behind-retention evidence. The TUI does not acquire
-   `ConsumerClient`, which also owns acknowledgement mutation. Event gap views
-   remain open pending an explicitly bounded content-disclosure contract rather
-   than importing event reads into the presentation.
-5. Add append, acknowledge, and compact only with exact confirmation,
+   `ConsumerClient`, which also owns acknowledgement mutation.
+5. Exact-confirmed bounded event disclosure is qualified against the real
+   daemon through a separate `DisclosureClient` and command. It caps batches at
+   16 events plus the negotiated frame ceiling, reports retention/publication
+   gaps explicitly, and never adds payloads to routine observation.
+6. Add append, acknowledge, and compact only with exact confirmation,
    authorization, retention constraints, and truthful uncertainty recovery.

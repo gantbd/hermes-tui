@@ -23,6 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    if mode == "disclose-events" {
+        return disclose_events(args);
+    }
     if mode != "interactive" && mode != "headless" {
         return Err(usage().into());
     }
@@ -74,6 +77,151 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         headless(port, configured_stream, configured_consumer)
     }
+}
+
+#[cfg(unix)]
+fn disclose_events(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = args
+        .next()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(usage)?;
+    let stream = args
+        .next()
+        .and_then(|value| hermes_tui::parse_stream_id(&value.to_string_lossy()))
+        .ok_or("stream must be 32 hexadecimal digits")?;
+    let start = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(usage)?;
+    let limit = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(usage)?;
+    let confirmation = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(usage)?;
+    if args.next().is_some() {
+        return Err(usage().into());
+    }
+    let port = match hermes_tui_local_client::LocalPort::connect(
+        socket,
+        hermes_tui_local_client::ClientLimits::default(),
+    ) {
+        Ok(port) => port,
+        Err(error) => return disclosure_failure("not_sent", &format!("{error:?}"), None),
+    };
+    let request = hermes_disclosure_command::DisclosureRequest {
+        stream,
+        start: hermes_protocol::EventSequenceV1(start),
+        limit,
+    };
+    match hermes_disclosure_command::disclose(
+        hermes_tui_local_client::CONNECTION_SESSION,
+        port,
+        request,
+        &confirmation,
+    ) {
+        Ok(batch) => {
+            let events = batch
+                .events
+                .into_iter()
+                .map(|event| {
+                    serde_json::json!({
+                        "sequence": event.sequence.0,
+                        "producer": hermes_disclosure_command::hex(&event.envelope.producer.0),
+                        "schema": hermes_disclosure_command::hex(&event.envelope.schema.0),
+                        "idempotency_key": hermes_disclosure_command::hex(&event.envelope.idempotency_key.0),
+                        "correlation": hermes_disclosure_command::hex(&event.envelope.correlation.0),
+                        "causation": event.envelope.causation.map(|value| hermes_disclosure_command::hex(&value.0)),
+                        "payload_hex": hermes_disclosure_command::hex(&event.envelope.payload),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let gap = batch.gap.map(|gap| match gap {
+                hermes_protocol::ReadGapV1::BeforeRetention {
+                    requested,
+                    retained_from,
+                } => {
+                    serde_json::json!({
+                        "kind": "before_retention",
+                        "requested": requested.0,
+                        "retained_from": retained_from.0,
+                    })
+                }
+                hermes_protocol::ReadGapV1::AheadOfPublication {
+                    requested,
+                    next_sequence,
+                } => {
+                    serde_json::json!({
+                        "kind": "ahead_of_publication",
+                        "requested": requested.0,
+                        "next_sequence": next_sequence.0,
+                    })
+                }
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "peer": "hermes",
+                    "capability": hermes_disclosure_command::CAPABILITY,
+                    "complete": true,
+                    "status": "current",
+                    "start": start,
+                    "limit": limit,
+                    "retained_from": batch.retained_from.0,
+                    "published_edge": batch.published_edge.map(|value| value.0),
+                    "gap": gap,
+                    "events": events,
+                }))?
+            );
+            Ok(())
+        }
+        Err(hermes_disclosure_command::DisclosureError::ConfirmationMismatch { required }) => {
+            disclosure_failure(
+                "confirmation_refused",
+                "exact disclosure confirmation required",
+                Some(&required),
+            )
+        }
+        Err(hermes_disclosure_command::DisclosureError::InvalidLimit) => disclosure_failure(
+            "limit_refused",
+            "event limit must be between 1 and 16",
+            None,
+        ),
+        Err(hermes_disclosure_command::DisclosureError::Transport(
+            hermes_tui_local_client::ClientError::OutcomeUnknown(error),
+        )) => disclosure_failure("outcome_unknown", &format!("{error:?}"), None),
+        Err(hermes_disclosure_command::DisclosureError::Refused(refusal)) => {
+            disclosure_failure("refused", &format!("{refusal:?}"), None)
+        }
+        Err(error) => disclosure_failure("unavailable", &format!("{error:?}"), None),
+    }
+}
+
+#[cfg(unix)]
+fn disclosure_failure(
+    status: &str,
+    message: &str,
+    required_confirmation: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "peer": "hermes",
+            "capability": hermes_disclosure_command::CAPABILITY,
+            "complete": false,
+            "status": status,
+            "required_confirmation": required_confirmation,
+        }))?
+    );
+    Err(std::io::Error::other(message).into())
 }
 
 #[cfg(unix)]
@@ -184,7 +332,7 @@ fn failure(status: &str, message: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn usage() -> &'static str {
-    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX] [--consumer CONSUMER_HEX]\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state; consumer requires stream"
+    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX] [--consumer CONSUMER_HEX] | hermes-tui disclose-events SOCKET STREAM_HEX START LIMIT 'DISCLOSE HERMES STREAM STREAM_HEX FROM START LIMIT LIMIT'\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state; consumer requires stream; event disclosure requires exact confirmation and is bounded to 16 events plus the negotiated frame ceiling"
 }
 
 #[cfg(not(unix))]
