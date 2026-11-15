@@ -4,8 +4,8 @@
 use std::{convert::Infallible, os::unix::net::UnixStream, path::PathBuf, time::Duration};
 
 use hermes_ledger::{
-    CorrelationId, EventEnvelopeV1, IdempotencyKey, Limits, ProducerId, SchemaId, StreamId,
-    persistence::CheckpointBudgetV1,
+    ConsumerId, CorrelationId, EventEnvelopeV1, EventSequence, IdempotencyKey, Limits, ProducerId,
+    SchemaId, StreamId, persistence::CheckpointBudgetV1,
 };
 use hermes_local_daemon::unix::{Authenticator, Daemon};
 use hermes_service::{
@@ -59,6 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         )
         .map_err(|error| std::io::Error::other(format!("seed failed: {error:?}")))?;
+    ledger
+        .acknowledge(
+            ConsumerId::new([6; 16]),
+            StreamId::new([5; 16]),
+            EventSequence(0),
+        )
+        .map_err(|error| std::io::Error::other(format!("cursor seed failed: {error:?}")))?;
     let service = Service::new(ledger, Policy, ServiceLimitsV1::default())
         .ok_or_else(|| std::io::Error::other("service configuration refused"))?;
     let mut daemon = Daemon::bind_new(

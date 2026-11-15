@@ -10,10 +10,14 @@ pid=$!
 i=0
 while [ ! -S "$tmp/hermes.sock" ]; do i=$((i+1)); if [ "$i" -ge 100 ]; then cat "$tmp/err" >&2; exit 1; fi; sleep 0.05; done
 output=$(cargo run --quiet --manifest-path "$root/Cargo.toml" -p hermes-tui-cli -- \
-  headless "$tmp/hermes.sock" --stream 05050505050505050505050505050505)
+  headless "$tmp/hermes.sock" --stream 05050505050505050505050505050505 \
+  --consumer 06060606060606060606060606060606)
 wait "$pid"; pid=
 printf '%s\n' "$output" | grep '"complete": true' >/dev/null
 printf '%s\n' "$output" | grep '"capability": "ledger.observe.v1"' >/dev/null
 printf '%s\n' "$output" | grep '"streams": 1' >/dev/null
 printf '%s\n' "$output" | grep '"status": "current"' >/dev/null
 printf '%s\n' "$output" | grep '"retained_events": 1' >/dev/null
+printf '%s\n' "$output" | grep '"configured_cursor": {' >/dev/null
+printf '%s\n' "$output" | grep '"next_sequence": 1' >/dev/null
+printf '%s\n' "$output" | grep '"backlog": 0' >/dev/null

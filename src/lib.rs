@@ -6,8 +6,8 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hermes_client::{ReadOnlyClient, ServicePort};
 use hermes_protocol::{
-    OperationalSignalsV1, OutcomeV1, ReplyV1, SessionHandleV1, StatusV1, StreamIdV1,
-    StreamObservationV1, UsageV1,
+    ConsumerCursorV1, ConsumerIdV1, OperationalSignalsV1, OutcomeV1, ReplyV1, SessionHandleV1,
+    StatusV1, StreamIdV1, StreamObservationV1, UsageV1,
 };
 use ratatui::{
     Frame,
@@ -27,8 +27,8 @@ pub struct CapabilityManifest {
 pub const CAPABILITIES: CapabilityManifest = CapabilityManifest {
     schema: 1,
     peer: "hermes",
-    interactive: &["ledger.observe.v1"],
-    headless: &["ledger.observe.v1"],
+    interactive: &["ledger.observe.v1", "ledger.cursor.observe.v1"],
+    headless: &["ledger.observe.v1", "ledger.cursor.observe.v1"],
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,12 +60,19 @@ pub struct Observation {
     pub usage: UsageV1,
     pub signals: OperationalSignalsV1,
     pub configured_stream: Option<ConfiguredStreamObservation>,
+    pub configured_cursor: Option<ConfiguredCursorObservation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfiguredStreamObservation {
     Missing,
     Current(StreamObservationV1),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfiguredCursorObservation {
+    Missing,
+    Current(ConsumerCursorV1),
 }
 
 struct WorkerReply(Result<Observation, String>);
@@ -96,12 +103,25 @@ impl Component {
         P: ServicePort + Send + 'static,
         P::Error: Send + 'static,
     {
+        Self::new_with_selection(session, port, configured_stream, None)
+    }
+
+    pub fn new_with_selection<P>(
+        session: SessionHandleV1,
+        port: P,
+        configured_stream: Option<StreamIdV1>,
+        configured_consumer: Option<ConsumerIdV1>,
+    ) -> Self
+    where
+        P: ServicePort + Send + 'static,
+        P::Error: Send + 'static,
+    {
         let (tx, rx) = sync_channel(1);
         let (reply_tx, reply_rx) = sync_channel(1);
         std::thread::spawn(move || {
             let mut client = ReadOnlyClient::new(session, port);
             while rx.recv().is_ok() {
-                let result = observe_configured(&mut client, configured_stream);
+                let result = observe_selected(&mut client, configured_stream, configured_consumer);
                 if reply_tx.send(WorkerReply(result)).is_err() {
                     break;
                 }
@@ -203,6 +223,32 @@ impl Component {
                         ]);
                     }
                 }
+                match value.configured_cursor {
+                    None => lines.push(Line::from("configured consumer: none")),
+                    Some(ConfiguredCursorObservation::Missing) => {
+                        lines.push(Line::from("configured consumer cursor: absent"));
+                    }
+                    Some(ConfiguredCursorObservation::Current(cursor)) => {
+                        lines.push(Line::from("configured consumer cursor: current"));
+                        lines.push(Line::from(format!(
+                            "next sequence: {}",
+                            cursor.next_sequence.0
+                        )));
+                        if let Some(ConfiguredStreamObservation::Current(stream)) =
+                            value.configured_stream
+                        {
+                            lines.push(Line::from(format!(
+                                "cursor backlog: {}{}",
+                                cursor_backlog(stream, cursor),
+                                if cursor.next_sequence < stream.retained_from {
+                                    " (behind retention)"
+                                } else {
+                                    ""
+                                }
+                            )));
+                        }
+                    }
+                }
                 lines
             },
         );
@@ -233,6 +279,17 @@ pub fn observe_configured<P: ServicePort>(
     client: &mut ReadOnlyClient<P>,
     configured_stream: Option<StreamIdV1>,
 ) -> Result<Observation, String> {
+    observe_selected(client, configured_stream, None)
+}
+
+pub fn observe_selected<P: ServicePort>(
+    client: &mut ReadOnlyClient<P>,
+    configured_stream: Option<StreamIdV1>,
+    configured_consumer: Option<ConsumerIdV1>,
+) -> Result<Observation, String> {
+    if configured_consumer.is_some() && configured_stream.is_none() {
+        return Err("Hermes consumer selector requires a stream selector".into());
+    }
     let status = match client.status().map_err(|_| "Hermes status unavailable")? {
         ReplyV1::Accepted(OutcomeV1::Status(value)) => value,
         ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
@@ -248,7 +305,8 @@ pub fn observe_configured<P: ServicePort>(
         ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
         _ => return Err("Invalid Hermes signals reply".into()),
     };
-    let configured_stream = match configured_stream {
+    let selected_stream = configured_stream;
+    let configured_stream = match selected_stream {
         None => None,
         Some(stream) => match client
             .stream_observation(stream)
@@ -264,17 +322,54 @@ pub fn observe_configured<P: ServicePort>(
             _ => return Err("Invalid Hermes stream observation reply".into()),
         },
     };
+    let configured_cursor = match (configured_consumer, configured_stream) {
+        (None, _) => None,
+        (Some(consumer), Some(ConfiguredStreamObservation::Current(_))) => match client
+            .cursor(consumer, selected_stream.expect("selected stream"))
+            .map_err(|_| "Hermes cursor observation unavailable")?
+        {
+            ReplyV1::Accepted(OutcomeV1::Cursor(Some(value))) => {
+                Some(ConfiguredCursorObservation::Current(value))
+            }
+            ReplyV1::Accepted(OutcomeV1::Cursor(None)) => {
+                Some(ConfiguredCursorObservation::Missing)
+            }
+            ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
+            _ => return Err("Invalid Hermes cursor observation reply".into()),
+        },
+        (Some(_), Some(ConfiguredStreamObservation::Missing)) => {
+            Some(ConfiguredCursorObservation::Missing)
+        }
+        (Some(_), None) => unreachable!("consumer without stream refused above"),
+    };
     Ok(Observation {
         status,
         usage,
         signals,
         configured_stream,
+        configured_cursor,
     })
+}
+
+pub fn cursor_backlog(stream: StreamObservationV1, cursor: ConsumerCursorV1) -> u64 {
+    stream
+        .published_edge
+        .and_then(|edge| edge.0.checked_add(1))
+        .unwrap_or(stream.retained_from.0)
+        .saturating_sub(cursor.next_sequence.0)
 }
 
 /// Parses one exact stream selector without assigning identity or exposing a
 /// catalogue. The selected identifier remains configuration input.
 pub fn parse_stream_id(value: &str) -> Option<StreamIdV1> {
+    parse_opaque_id(value).map(StreamIdV1)
+}
+
+pub fn parse_consumer_id(value: &str) -> Option<ConsumerIdV1> {
+    parse_opaque_id(value).map(ConsumerIdV1)
+}
+
+fn parse_opaque_id(value: &str) -> Option<[u8; 16]> {
     if value.len() != 32 {
         return None;
     }
@@ -282,7 +377,7 @@ pub fn parse_stream_id(value: &str) -> Option<StreamIdV1> {
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
     }
-    Some(StreamIdV1(bytes))
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -296,5 +391,8 @@ mod tests {
         assert!(parse_stream_id("05").is_none());
         assert!(parse_stream_id("gggggggggggggggggggggggggggggggg").is_none());
         assert_eq!(format!("{stream:?}"), "StreamIdV1(<opaque>)");
+        let consumer = parse_consumer_id("06060606060606060606060606060606").unwrap();
+        assert_eq!(consumer, ConsumerIdV1([6; 16]));
+        assert_eq!(format!("{consumer:?}"), "ConsumerIdV1(<opaque>)");
     }
 }
