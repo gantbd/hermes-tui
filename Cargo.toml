@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["local-client", "cli"]
+
+[package]
+name = "hermes-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Composable terminal presentation for Hermes ledger operations"
+
+[dependencies]
+hermes-client = { version = "=0.1.0", path = "../hermes/crates/hermes-client" }
+hermes-protocol = { version = "=0.1.0", path = "../hermes/crates/hermes-protocol" }
+ratatui = { version = "=0.30.2", default-features = false }
+crossterm = "=0.29.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+[lints.clippy]
+all = "warn"

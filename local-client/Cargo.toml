@@ -1,0 +1,17 @@
+[package]
+name = "hermes-tui-local-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+hermes-client = { version = "=0.1.0", path = "../../hermes/crates/hermes-client" }
+hermes-protocol = { version = "=0.1.0", path = "../../hermes/crates/hermes-protocol" }
+hermes-wire = { version = "=0.1.0", path = "../../hermes/crates/hermes-wire" }
+
+[lints.rust]
+unsafe_code = "forbid"
+[lints.clippy]
+all = "warn"
