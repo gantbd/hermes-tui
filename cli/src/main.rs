@@ -27,7 +27,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(usage().into());
     }
     let socket = match args.next() {
-        Some(value) if args.next().is_none() => std::path::PathBuf::from(value),
+        Some(value) => std::path::PathBuf::from(value),
+        _ if mode == "headless" => return failure("configuration_refused", usage()),
+        _ => return Err(usage().into()),
+    };
+    let configured_stream = match (args.next(), args.next(), args.next()) {
+        (None, None, None) => None,
+        (Some(flag), Some(value), None) if flag == "--stream" => {
+            match hermes_tui::parse_stream_id(&value.to_string_lossy()) {
+                Some(stream) => Some(stream),
+                None if mode == "headless" => {
+                    return failure(
+                        "configuration_refused",
+                        "stream must be 32 hexadecimal digits",
+                    );
+                }
+                None => return Err("stream must be 32 hexadecimal digits".into()),
+            }
+        }
         _ if mode == "headless" => return failure("configuration_refused", usage()),
         _ => return Err(usage().into()),
     };
@@ -42,12 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(std::io::Error::other(format!("{error:?}")).into()),
     };
     if mode == "interactive" {
-        interactive(hermes_tui::Component::new(
+        interactive(hermes_tui::Component::new_with_stream(
             hermes_tui_local_client::CONNECTION_SESSION,
             port,
+            configured_stream,
         ))
     } else {
-        headless(port)
+        headless(port, configured_stream)
     }
 }
 
@@ -74,12 +92,28 @@ fn interactive(mut component: hermes_tui::Component) -> Result<(), Box<dyn std::
 }
 
 #[cfg(unix)]
-fn headless(port: hermes_tui_local_client::LocalPort) -> Result<(), Box<dyn std::error::Error>> {
+fn headless(
+    port: hermes_tui_local_client::LocalPort,
+    configured_stream: Option<hermes_protocol::StreamIdV1>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut client =
         hermes_client::ReadOnlyClient::new(hermes_tui_local_client::CONNECTION_SESSION, port);
-    match hermes_tui::observe(&mut client) {
+    match hermes_tui::observe_configured(&mut client, configured_stream) {
         Ok(value) => {
             let manifest = hermes_tui::CAPABILITIES;
+            let stream = value.configured_stream.map(|selection| match selection {
+                hermes_tui::ConfiguredStreamObservation::Missing => {
+                    serde_json::json!({"status": "absent"})
+                }
+                hermes_tui::ConfiguredStreamObservation::Current(stream) => serde_json::json!({
+                    "status": "current", "retained_from": stream.retained_from.0,
+                    "published_edge": stream.published_edge.map(|edge| edge.0),
+                    "retained_events": stream.retained_events,
+                    "consumer_count": stream.consumer_count,
+                    "stalled_consumers": stream.stalled_consumers,
+                    "max_consumer_backlog": stream.max_consumer_backlog,
+                }),
+            });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -89,6 +123,7 @@ fn headless(port: hermes_tui_local_client::LocalPort) -> Result<(), Box<dyn std:
                     "streams": value.usage.streams, "events": value.usage.events,
                     "cursors": value.usage.cursors, "commits": value.signals.commits,
                     "conflicts": value.signals.conflicts, "saturated": value.signals.saturated,
+                    "configured_stream": stream,
                 }))?
             );
             Ok(())
@@ -111,7 +146,7 @@ fn failure(status: &str, message: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn usage() -> &'static str {
-    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state"
+    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX]\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state"
 }
 
 #[cfg(not(unix))]

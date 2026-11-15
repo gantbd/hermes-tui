@@ -3,7 +3,10 @@
 
 use std::{convert::Infallible, os::unix::net::UnixStream, path::PathBuf, time::Duration};
 
-use hermes_ledger::{Limits, persistence::CheckpointBudgetV1};
+use hermes_ledger::{
+    CorrelationId, EventEnvelopeV1, IdempotencyKey, Limits, ProducerId, SchemaId, StreamId,
+    persistence::CheckpointBudgetV1,
+};
 use hermes_local_daemon::unix::{Authenticator, Daemon};
 use hermes_service::{
     AuthenticatedSessionV1, AuthorizationActionV1, AuthorizationResourceV1, Authorizer, Service,
@@ -39,9 +42,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         return Err("unexpected argument".into());
     }
-    let ledger =
+    let mut ledger =
         hermes_local::create_new(&directory, Limits::default(), CheckpointBudgetV1::default())
             .map_err(|error| std::io::Error::other(format!("ledger failed: {error:?}")))?;
+    ledger
+        .append(
+            StreamId::new([5; 16]),
+            None,
+            EventEnvelopeV1::new(
+                ProducerId::new([6; 16]),
+                SchemaId::new([7; 16]),
+                IdempotencyKey::new([8; 16]),
+                CorrelationId::new([9; 16]),
+                None,
+                vec![10],
+            ),
+        )
+        .map_err(|error| std::io::Error::other(format!("seed failed: {error:?}")))?;
     let service = Service::new(ledger, Policy, ServiceLimitsV1::default())
         .ok_or_else(|| std::io::Error::other("service configuration refused"))?;
     let mut daemon = Daemon::bind_new(

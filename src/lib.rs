@@ -6,7 +6,8 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hermes_client::{ReadOnlyClient, ServicePort};
 use hermes_protocol::{
-    OperationalSignalsV1, OutcomeV1, ReplyV1, SessionHandleV1, StatusV1, UsageV1,
+    OperationalSignalsV1, OutcomeV1, ReplyV1, SessionHandleV1, StatusV1, StreamIdV1,
+    StreamObservationV1, UsageV1,
 };
 use ratatui::{
     Frame,
@@ -58,6 +59,13 @@ pub struct Observation {
     pub status: StatusV1,
     pub usage: UsageV1,
     pub signals: OperationalSignalsV1,
+    pub configured_stream: Option<ConfiguredStreamObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfiguredStreamObservation {
+    Missing,
+    Current(StreamObservationV1),
 }
 
 struct WorkerReply(Result<Observation, String>);
@@ -76,12 +84,24 @@ impl Component {
         P: ServicePort + Send + 'static,
         P::Error: Send + 'static,
     {
+        Self::new_with_stream(session, port, None)
+    }
+
+    pub fn new_with_stream<P>(
+        session: SessionHandleV1,
+        port: P,
+        configured_stream: Option<StreamIdV1>,
+    ) -> Self
+    where
+        P: ServicePort + Send + 'static,
+        P::Error: Send + 'static,
+    {
         let (tx, rx) = sync_channel(1);
         let (reply_tx, reply_rx) = sync_channel(1);
         std::thread::spawn(move || {
             let mut client = ReadOnlyClient::new(session, port);
             while rx.recv().is_ok() {
-                let result = observe(&mut client);
+                let result = observe_configured(&mut client, configured_stream);
                 if reply_tx.send(WorkerReply(result)).is_err() {
                     break;
                 }
@@ -144,7 +164,7 @@ impl Component {
         let lines = self.observation.map_or_else(
             || vec![Line::from("No current ledger observation")],
             |value| {
-                vec![
+                let mut lines = vec![
                     Line::from(format!(
                         "storage revision: {:?}",
                         value.status.storage_revision
@@ -155,7 +175,35 @@ impl Component {
                     Line::from(format!("cursors: {}", value.usage.cursors)),
                     Line::from(format!("commits: {}", value.signals.commits)),
                     Line::from(format!("conflicts: {}", value.signals.conflicts)),
-                ]
+                ];
+                match value.configured_stream {
+                    None => lines.push(Line::from("configured stream: none")),
+                    Some(ConfiguredStreamObservation::Missing) => {
+                        lines.push(Line::from("configured stream: absent"));
+                    }
+                    Some(ConfiguredStreamObservation::Current(stream)) => {
+                        lines.extend([
+                            Line::from("configured stream: current"),
+                            Line::from(format!(
+                                "retained/published: {}/{}",
+                                stream.retained_from.0,
+                                stream
+                                    .published_edge
+                                    .map_or_else(|| "none".into(), |edge| edge.0.to_string())
+                            )),
+                            Line::from(format!("retained events: {}", stream.retained_events)),
+                            Line::from(format!(
+                                "consumers/stalled: {}/{}",
+                                stream.consumer_count, stream.stalled_consumers
+                            )),
+                            Line::from(format!(
+                                "max consumer backlog: {}",
+                                stream.max_consumer_backlog
+                            )),
+                        ]);
+                    }
+                }
+                lines
             },
         );
         frame.render_widget(
@@ -178,6 +226,13 @@ impl Component {
 }
 
 pub fn observe<P: ServicePort>(client: &mut ReadOnlyClient<P>) -> Result<Observation, String> {
+    observe_configured(client, None)
+}
+
+pub fn observe_configured<P: ServicePort>(
+    client: &mut ReadOnlyClient<P>,
+    configured_stream: Option<StreamIdV1>,
+) -> Result<Observation, String> {
     let status = match client.status().map_err(|_| "Hermes status unavailable")? {
         ReplyV1::Accepted(OutcomeV1::Status(value)) => value,
         ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
@@ -193,9 +248,53 @@ pub fn observe<P: ServicePort>(client: &mut ReadOnlyClient<P>) -> Result<Observa
         ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
         _ => return Err("Invalid Hermes signals reply".into()),
     };
+    let configured_stream = match configured_stream {
+        None => None,
+        Some(stream) => match client
+            .stream_observation(stream)
+            .map_err(|_| "Hermes stream observation unavailable")?
+        {
+            ReplyV1::Accepted(OutcomeV1::StreamObservation(Some(value))) => {
+                Some(ConfiguredStreamObservation::Current(value))
+            }
+            ReplyV1::Accepted(OutcomeV1::StreamObservation(None)) => {
+                Some(ConfiguredStreamObservation::Missing)
+            }
+            ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
+            _ => return Err("Invalid Hermes stream observation reply".into()),
+        },
+    };
     Ok(Observation {
         status,
         usage,
         signals,
+        configured_stream,
     })
+}
+
+/// Parses one exact stream selector without assigning identity or exposing a
+/// catalogue. The selected identifier remains configuration input.
+pub fn parse_stream_id(value: &str) -> Option<StreamIdV1> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(StreamIdV1(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_selector_is_exact_and_remains_opaque() {
+        let stream = parse_stream_id("05050505050505050505050505050505").unwrap();
+        assert_eq!(stream, StreamIdV1([5; 16]));
+        assert!(parse_stream_id("05").is_none());
+        assert!(parse_stream_id("gggggggggggggggggggggggggggggggg").is_none());
+        assert_eq!(format!("{stream:?}"), "StreamIdV1(<opaque>)");
+    }
 }
