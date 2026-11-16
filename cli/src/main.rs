@@ -26,6 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode == "disclose-events" {
         return disclose_events(args);
     }
+    if mode == "acknowledge" {
+        return acknowledge(args);
+    }
     if mode != "interactive" && mode != "headless" {
         return Err(usage().into());
     }
@@ -77,6 +80,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         headless(port, configured_stream, configured_consumer)
     }
+}
+
+#[cfg(unix)]
+fn acknowledge(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = args
+        .next()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(usage)?;
+    let consumer = args
+        .next()
+        .and_then(|value| hermes_tui::parse_consumer_id(&value.to_string_lossy()))
+        .ok_or("consumer must be 32 hexadecimal digits")?;
+    let stream = args
+        .next()
+        .and_then(|value| hermes_tui::parse_stream_id(&value.to_string_lossy()))
+        .ok_or("stream must be 32 hexadecimal digits")?;
+    let expected_next = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(usage)?;
+    let through = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(usage)?;
+    let confirmation = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(usage)?;
+    if args.next().is_some() {
+        return Err(usage().into());
+    }
+    let port = match hermes_tui_local_client::LocalPort::connect(
+        socket,
+        hermes_tui_local_client::ClientLimits::default(),
+    ) {
+        Ok(port) => port,
+        Err(error) => return acknowledge_failure("not_sent", &format!("{error:?}"), None, None),
+    };
+    let request = hermes_consumer_command::AcknowledgeRequest {
+        consumer,
+        stream,
+        expected_next: hermes_protocol::EventSequenceV1(expected_next),
+        through: hermes_protocol::EventSequenceV1(through),
+    };
+    match hermes_consumer_command::acknowledge(
+        hermes_tui_local_client::CONNECTION_SESSION,
+        port,
+        request,
+        &confirmation,
+    ) {
+        Ok(cursor) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "peer": "hermes",
+                    "capability": hermes_consumer_command::CAPABILITY,
+                    "complete": true,
+                    "status": "acknowledged",
+                    "previous_next_sequence": expected_next,
+                    "next_sequence": cursor.next_sequence.0,
+                }))?
+            );
+            Ok(())
+        }
+        Err(hermes_consumer_command::AcknowledgeError::ConfirmationMismatch { required }) => {
+            acknowledge_failure(
+                "confirmation_refused",
+                "exact acknowledgement confirmation required",
+                Some(&required),
+                None,
+            )
+        }
+        Err(hermes_consumer_command::AcknowledgeError::InvalidRange) => acknowledge_failure(
+            "range_refused",
+            "through must not precede the observed next sequence",
+            None,
+            None,
+        ),
+        Err(hermes_consumer_command::AcknowledgeError::CursorMissing) => {
+            acknowledge_failure("cursor_absent", "consumer cursor is absent", None, None)
+        }
+        Err(hermes_consumer_command::AcknowledgeError::CursorChanged { actual }) => {
+            acknowledge_failure(
+                "stale_cursor",
+                "consumer cursor changed",
+                None,
+                Some(actual.0),
+            )
+        }
+        Err(hermes_consumer_command::AcknowledgeError::MutationTransport(
+            hermes_tui_local_client::ClientError::OutcomeUnknown(error),
+        )) => acknowledge_failure("outcome_unknown", &format!("{error:?}"), None, None),
+        Err(hermes_consumer_command::AcknowledgeError::MutationRefused(refusal)) => {
+            acknowledge_failure("refused", &format!("{refusal:?}"), None, None)
+        }
+        Err(error) => acknowledge_failure("unavailable", &format!("{error:?}"), None, None),
+    }
+}
+
+#[cfg(unix)]
+fn acknowledge_failure(
+    status: &str,
+    message: &str,
+    required_confirmation: Option<&str>,
+    actual_next_sequence: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "peer": "hermes",
+            "capability": hermes_consumer_command::CAPABILITY,
+            "complete": false,
+            "status": status,
+            "required_confirmation": required_confirmation,
+            "actual_next_sequence": actual_next_sequence,
+        }))?
+    );
+    Err(std::io::Error::other(message).into())
 }
 
 #[cfg(unix)]
@@ -332,7 +459,7 @@ fn failure(status: &str, message: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn usage() -> &'static str {
-    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX] [--consumer CONSUMER_HEX] | hermes-tui disclose-events SOCKET STREAM_HEX START LIMIT 'DISCLOSE HERMES STREAM STREAM_HEX FROM START LIMIT LIMIT'\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state; consumer requires stream; event disclosure requires exact confirmation and is bounded to 16 events plus the negotiated frame ceiling"
+    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX] [--consumer CONSUMER_HEX] | hermes-tui disclose-events SOCKET STREAM_HEX START LIMIT 'DISCLOSE HERMES STREAM STREAM_HEX FROM START LIMIT LIMIT' | hermes-tui acknowledge SOCKET CONSUMER_HEX STREAM_HEX EXPECTED_NEXT THROUGH 'ACKNOWLEDGE HERMES CONSUMER CONSUMER_HEX STREAM STREAM_HEX FROM EXPECTED_NEXT THROUGH THROUGH'\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state; consumer requires stream; disclosure and acknowledgement require exact confirmation; acknowledgement observes the current cursor and attempts one mutation on the same connection"
 }
 
 #[cfg(not(unix))]

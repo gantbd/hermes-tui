@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["disclosure-command", "local-client", "cli"]
+members = ["consumer-command", "disclosure-command", "local-client", "cli"]
 
 [package]
 name = "hermes-tui"

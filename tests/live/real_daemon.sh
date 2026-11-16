@@ -24,6 +24,22 @@ start_fixture() {
 
 finish_fixture() { wait "$pid"; pid=; }
 
+start_consumer_fixture() {
+  name=$1
+  rm -rf "$tmp/$name-ledger"
+  rm -f "$tmp/$name.sock"
+  cargo run --quiet --manifest-path "$root/Cargo.toml" -p hermes-tui-cli \
+    --example consumer_daemon_fixture -- "$tmp/$name-ledger" "$tmp/$name.sock" \
+    >"$tmp/$name.out" 2>"$tmp/$name.err" &
+  pid=$!
+  i=0
+  while [ ! -S "$tmp/$name.sock" ]; do
+    i=$((i+1))
+    if [ "$i" -ge 100 ]; then cat "$tmp/$name.err" >&2; exit 1; fi
+    sleep 0.05
+  done
+}
+
 start_fixture observe
 output=$(cargo run --quiet --manifest-path "$root/Cargo.toml" -p hermes-tui-cli -- \
   headless "$tmp/observe.sock" --stream 05050505050505050505050505050505 \
@@ -69,4 +85,34 @@ event = value["events"][0]
 assert event["sequence"] == 0 and event["payload_hex"] == "0a"
 '
 
-echo 'PASS: real Hermes daemon -> content-free observation and exact-confirmed bounded disclosure'
+start_consumer_fixture acknowledge-refused
+if refused=$(cargo run --quiet --manifest-path "$root/Cargo.toml" -p hermes-tui-cli -- \
+  acknowledge "$tmp/acknowledge-refused.sock" \
+  06060606060606060606060606060606 05050505050505050505050505050505 1 1 \
+  'acknowledge' 2>"$tmp/acknowledge-refused-client.err"); then
+  echo 'FAIL: inexact Hermes acknowledgement confirmation was accepted' >&2
+  exit 1
+fi
+finish_fixture
+printf '%s' "$refused" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert not value["complete"] and value["status"] == "confirmation_refused"
+assert value["required_confirmation"] == "ACKNOWLEDGE HERMES CONSUMER 06060606060606060606060606060606 STREAM 05050505050505050505050505050505 FROM 1 THROUGH 1"
+'
+
+start_consumer_fixture acknowledge
+acknowledged=$(cargo run --quiet --manifest-path "$root/Cargo.toml" -p hermes-tui-cli -- \
+  acknowledge "$tmp/acknowledge.sock" \
+  06060606060606060606060606060606 05050505050505050505050505050505 1 1 \
+  'ACKNOWLEDGE HERMES CONSUMER 06060606060606060606060606060606 STREAM 05050505050505050505050505050505 FROM 1 THROUGH 1')
+finish_fixture
+printf '%s' "$acknowledged" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["complete"] and value["capability"] == "ledger.acknowledge.v1"
+assert value["status"] == "acknowledged"
+assert value["previous_next_sequence"] == 1 and value["next_sequence"] == 2
+'
+
+echo 'PASS: real Hermes daemon -> observation, bounded disclosure and same-connection exact-confirmed acknowledgement'

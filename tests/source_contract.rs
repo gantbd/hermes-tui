@@ -11,3 +11,26 @@ fn reusable_component_is_read_only_and_application_free() {
     assert!(!source.contains("ratatui::run"));
     assert!(!source.contains("std::env::args"));
 }
+
+#[test]
+fn acknowledgement_guard_stays_outside_the_reusable_read_only_component() {
+    let command = include_str!("../consumer-command/src/lib.rs");
+    let cli = include_str!("../cli/src/main.rs");
+    let gate = include_str!("live/real_daemon.sh");
+    for required in [
+        "ledger.acknowledge.v1",
+        "ConsumerClient",
+        "CursorChanged",
+        "MutationTransport",
+        "ACKNOWLEDGE HERMES CONSUMER",
+    ] {
+        assert!(
+            command.contains(required),
+            "consumer guard omits {required}"
+        );
+    }
+    assert!(cli.contains("hermes_consumer_command::acknowledge"));
+    assert!(gate.contains("consumer_daemon_fixture"));
+    assert!(gate.contains("previous_next_sequence"));
+    assert!(gate.contains("next_sequence"));
+}

@@ -14,5 +14,8 @@
    daemon through a separate `DisclosureClient` and command. It caps batches at
    16 events plus the negotiated frame ceiling, reports retention/publication
    gaps explicitly, and never adds payloads to routine observation.
-6. Add append, acknowledge, and compact only with exact confirmation,
-   authorization, retention constraints, and truthful uncertainty recovery.
+6. A separate consumer command now observes the exact current cursor and
+   performs one exact-confirmed acknowledgement on the same connection. It
+   never retries a post-send failure, and the reusable TUI remains read-only.
+   Add append and compact only with exact confirmation, authorization,
+   retention constraints, and truthful uncertainty recovery.

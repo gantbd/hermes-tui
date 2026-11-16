@@ -16,6 +16,12 @@ Event payloads are available only through the separate
 at most 16 events, and remains bounded by the negotiated 2 MiB frame ceiling.
 Routine observation never calls this client and remains content-free.
 
+Acknowledgement is likewise a separate `ledger.acknowledge.v1` command. It
+observes the exact current cursor, compares it with the operator's expected
+position, and attempts one exact-confirmed acknowledgement on the same
+connection. A post-send transport failure is outcome-unknown and is never
+retried. The reusable component still does not acquire `ConsumerClient`.
+
 Standalone selection is explicit:
 
 ```text
@@ -25,4 +31,7 @@ hermes-tui headless /path/to/hermes.sock \
 
 hermes-tui disclose-events /path/to/hermes.sock STREAM_HEX 0 4 \
   'DISCLOSE HERMES STREAM STREAM_HEX FROM 0 LIMIT 4'
+
+hermes-tui acknowledge /path/to/hermes.sock CONSUMER_HEX STREAM_HEX 1 1 \
+  'ACKNOWLEDGE HERMES CONSUMER CONSUMER_HEX STREAM STREAM_HEX FROM 1 THROUGH 1'
 ```
