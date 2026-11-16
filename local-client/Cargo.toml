@@ -7,9 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-hermes-client = { version = "=0.1.0", path = "../../hermes/crates/hermes-client" }
-hermes-protocol = { version = "=0.1.0", path = "../../hermes/crates/hermes-protocol" }
-hermes-wire = { version = "=0.1.0", path = "../../hermes/crates/hermes-wire" }
+hermes-local-client = { version = "=0.1.0", path = "../../hermes/crates/hermes-local-client" }
 
 [lints.rust]
 unsafe_code = "forbid"

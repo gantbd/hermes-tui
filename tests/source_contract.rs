@@ -78,3 +78,16 @@ fn command_guards_are_owned_by_hermes_not_presentation() {
         assert!(cli.contains(command));
     }
 }
+
+#[test]
+fn local_transport_is_owned_by_hermes_not_presentation() {
+    let manifest = include_str!("../local-client/Cargo.toml");
+    let facade = include_str!("../local-client/src/lib.rs");
+    assert!(manifest.contains("hermes-local-client"));
+    for leaked in ["hermes-client =", "hermes-protocol =", "hermes-wire ="] {
+        assert!(!manifest.contains(leaked), "facade retains {leaked}");
+    }
+    assert!(facade.contains("pub use hermes_local_client::*;"));
+    assert!(!facade.contains("UnixStream"));
+    assert!(!facade.contains("encode_request"));
+}

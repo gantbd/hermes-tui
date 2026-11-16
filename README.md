@@ -19,6 +19,12 @@ Disclosure, acknowledgement, and compaction guards are owned by Hermes; this
 repository's standalone shell invokes them without making presentation their
 semantic owner.
 
+The reusable Unix transport now belongs to the engine-owned
+`hermes-local-client` crate. This repository's `hermes-tui-local-client` crate
+is a compatibility re-export only; new shells, Workbench surfaces, and adapters
+should depend on the owner client directly rather than importing transport from
+a presentation package.
+
 Acknowledgement is likewise a separate `ledger.acknowledge.v1` command. It
 observes the exact current cursor, compares it with the operator's expected
 position, and attempts one exact-confirmed acknowledgement on the same
