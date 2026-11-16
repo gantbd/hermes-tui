@@ -7,7 +7,8 @@ for required in CHANGELOG.md CONTRIBUTING.md LICENSE-APACHE LICENSE-MIT README.m
 done
 
 rg -q '^channel = "1\.95\.0"$' rust-toolchain.toml
-rg -q '"remoteReachabilityQualified": false' release/github-source.json
+rg -q '"remoteReachabilityQualified": true' release/github-source.json
+rg -q '"qualificationRevision": "3f389a41db6bcaa36cc0a7681ed26c4d3bb86b86"' release/github-source.json
 rg -q '"revision": "2e4faf10ec0a70805aa1db1555f93c77fcf0a1e4"' release/github-source.json
 rg -q '"revision": "b272106cf6d0093839a7d696c829bf8a408b0306"' release/github-source.json
 rg -q '"revision": "3f60c1c7b00b1a61230508b11422ddfc84b61856"' release/github-source.json

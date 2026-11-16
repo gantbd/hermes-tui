@@ -2,7 +2,9 @@
   "schema": 1,
   "channel": "github-coordinated-source",
   "hermesTuiRepository": "https://github.com/gantbd/hermes-tui",
-  "remoteReachabilityQualified": false,
+  "remoteReachabilityQualified": true,
+  "qualificationRevision": "3f389a41db6bcaa36cc0a7681ed26c4d3bb86b86",
+  "qualificationRun": "https://github.com/gantbd/hermes-tui/actions/runs/43974455876",
   "dependencies": {
     "keystone": {
       "repository": "https://github.com/gantbd/keystone",
