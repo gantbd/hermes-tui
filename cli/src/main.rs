@@ -29,6 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode == "acknowledge" {
         return acknowledge(args);
     }
+    if mode == "compact" {
+        return compact(args);
+    }
     if mode != "interactive" && mode != "headless" {
         return Err(usage().into());
     }
@@ -80,6 +83,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         headless(port, configured_stream, configured_consumer)
     }
+}
+
+#[cfg(unix)]
+fn compact(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = args
+        .next()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(usage)?;
+    let stream = args
+        .next()
+        .and_then(|value| hermes_tui::parse_stream_id(&value.to_string_lossy()))
+        .ok_or("stream must be 32 hexadecimal digits")?;
+    let expected_retained_from = parse_sequence(args.next())?;
+    let expected_published_edge = parse_sequence(args.next())?;
+    let through = parse_sequence(args.next())?;
+    let confirmation = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(usage)?;
+    if args.next().is_some() {
+        return Err(usage().into());
+    }
+    let port = match hermes_tui_local_client::LocalPort::connect(
+        socket,
+        hermes_tui_local_client::ClientLimits::default(),
+    ) {
+        Ok(port) => port,
+        Err(error) => return compact_failure("not_sent", &format!("{error:?}"), None, None),
+    };
+    let request = hermes_operator_command::CompactRequest {
+        stream,
+        expected_retained_from: hermes_protocol::EventSequenceV1(expected_retained_from),
+        expected_published_edge: hermes_protocol::EventSequenceV1(expected_published_edge),
+        through: hermes_protocol::EventSequenceV1(through),
+    };
+    match hermes_operator_command::compact(
+        hermes_tui_local_client::CONNECTION_SESSION,
+        port,
+        request,
+        &confirmation,
+    ) {
+        Ok(outcome) => {
+            let (status, removed, retained_from) = match outcome {
+                hermes_protocol::CompactionOutcomeV1::Compacted {
+                    removed,
+                    retained_from,
+                } => ("compacted", removed, retained_from.0),
+                hermes_protocol::CompactionOutcomeV1::Identity { retained_from } => {
+                    ("identity", 0, retained_from.0)
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "peer": "hermes",
+                    "capability": hermes_operator_command::CAPABILITY,
+                    "complete": true,
+                    "status": status,
+                    "removed": removed,
+                    "retained_from": retained_from,
+                }))?
+            );
+            Ok(())
+        }
+        Err(hermes_operator_command::CompactError::ConfirmationMismatch { required }) => {
+            compact_failure(
+                "confirmation_refused",
+                "exact compaction confirmation required",
+                Some(&required),
+                None,
+            )
+        }
+        Err(hermes_operator_command::CompactError::InvalidRange) => compact_failure(
+            "range_refused",
+            "compaction boundary must be inside the observed retained range",
+            None,
+            None,
+        ),
+        Err(hermes_operator_command::CompactError::StreamMissing) => {
+            compact_failure("stream_absent", "stream is absent", None, None)
+        }
+        Err(hermes_operator_command::CompactError::StreamChanged { actual }) => compact_failure(
+            "stale_stream",
+            "stream retention or publication edge changed",
+            None,
+            Some((
+                actual.retained_from.0,
+                actual.published_edge.map(|edge| edge.0),
+            )),
+        ),
+        Err(hermes_operator_command::CompactError::MutationTransport(
+            hermes_tui_local_client::ClientError::OutcomeUnknown(error),
+        )) => compact_failure("outcome_unknown", &format!("{error:?}"), None, None),
+        Err(hermes_operator_command::CompactError::MutationRefused(refusal)) => {
+            compact_failure("refused", &format!("{refusal:?}"), None, None)
+        }
+        Err(error) => compact_failure("unavailable", &format!("{error:?}"), None, None),
+    }
+}
+
+#[cfg(unix)]
+fn parse_sequence(value: Option<std::ffi::OsString>) -> Result<u64, Box<dyn std::error::Error>> {
+    value
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| usage().into())
+}
+
+#[cfg(unix)]
+fn compact_failure(
+    status: &str,
+    message: &str,
+    required_confirmation: Option<&str>,
+    actual_stream: Option<(u64, Option<u64>)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "peer": "hermes",
+            "capability": hermes_operator_command::CAPABILITY,
+            "complete": false,
+            "status": status,
+            "required_confirmation": required_confirmation,
+            "actual_retained_from": actual_stream.map(|value| value.0),
+            "actual_published_edge": actual_stream.and_then(|value| value.1),
+        }))?
+    );
+    Err(std::io::Error::other(message).into())
 }
 
 #[cfg(unix)]
@@ -459,7 +594,7 @@ fn failure(status: &str, message: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn usage() -> &'static str {
-    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX] [--consumer CONSUMER_HEX] | hermes-tui disclose-events SOCKET STREAM_HEX START LIMIT 'DISCLOSE HERMES STREAM STREAM_HEX FROM START LIMIT LIMIT' | hermes-tui acknowledge SOCKET CONSUMER_HEX STREAM_HEX EXPECTED_NEXT THROUGH 'ACKNOWLEDGE HERMES CONSUMER CONSUMER_HEX STREAM STREAM_HEX FROM EXPECTED_NEXT THROUGH THROUGH'\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state; consumer requires stream; disclosure and acknowledgement require exact confirmation; acknowledgement observes the current cursor and attempts one mutation on the same connection"
+    "usage: hermes-tui capabilities | hermes-tui <interactive|headless> SOCKET [--stream STREAM_HEX] [--consumer CONSUMER_HEX] | hermes-tui disclose-events SOCKET STREAM_HEX START LIMIT 'DISCLOSE HERMES STREAM STREAM_HEX FROM START LIMIT LIMIT' | hermes-tui acknowledge SOCKET CONSUMER_HEX STREAM_HEX EXPECTED_NEXT THROUGH 'ACKNOWLEDGE HERMES CONSUMER CONSUMER_HEX STREAM STREAM_HEX FROM EXPECTED_NEXT THROUGH THROUGH' | hermes-tui compact SOCKET STREAM_HEX EXPECTED_RETAINED_FROM EXPECTED_PUBLISHED_EDGE THROUGH 'COMPACT HERMES STREAM STREAM_HEX RETAINED FROM EXPECTED_RETAINED_FROM PUBLISHED EDGE EXPECTED_PUBLISHED_EDGE THROUGH THROUGH'\nheadless emits one bounded versioned ledger.observe.v1 observation without constructing TUI state; consumer requires stream; disclosure, acknowledgement and compaction require exact confirmation; mutations observe their current state and attempt once on the same connection"
 }
 
 #[cfg(not(unix))]

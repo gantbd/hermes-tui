@@ -17,5 +17,8 @@
 6. A separate consumer command now observes the exact current cursor and
    performs one exact-confirmed acknowledgement on the same connection. It
    never retries a post-send failure, and the reusable TUI remains read-only.
-   Add append and compact only with exact confirmation, authorization,
-   retention constraints, and truthful uncertainty recovery.
+7. A separate operator command now observes the exact retained frontier and
+   published edge before performing one exact-confirmed compaction on the same
+   connection. Stale state prevents mutation; uncertain delivery is not
+   retried. Add append only with an explicit domain envelope and equally strong
+   authorization and uncertainty rules.

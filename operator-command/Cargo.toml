@@ -1,0 +1,17 @@
+[package]
+name = "hermes-operator-command"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Same-connection exact-state guard for Hermes compaction"
+
+[dependencies]
+hermes-client = { version = "=0.1.0", path = "../../hermes/crates/hermes-client" }
+hermes-protocol = { version = "=0.1.0", path = "../../hermes/crates/hermes-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
+[lints.clippy]
+all = "warn"

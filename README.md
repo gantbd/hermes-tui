@@ -22,6 +22,12 @@ position, and attempts one exact-confirmed acknowledgement on the same
 connection. A post-send transport failure is outcome-unknown and is never
 retried. The reusable component still does not acquire `ConsumerClient`.
 
+Compaction is isolated in `ledger.compact.v1`. Its guard observes the stream's
+retained frontier and published edge, compares both with the operator's exact
+expectation, and then attempts one confirmed compaction on the same connection.
+It never retries an uncertain result, and `OperatorClient` remains outside the
+reusable component.
+
 Standalone selection is explicit:
 
 ```text
@@ -34,4 +40,7 @@ hermes-tui disclose-events /path/to/hermes.sock STREAM_HEX 0 4 \
 
 hermes-tui acknowledge /path/to/hermes.sock CONSUMER_HEX STREAM_HEX 1 1 \
   'ACKNOWLEDGE HERMES CONSUMER CONSUMER_HEX STREAM STREAM_HEX FROM 1 THROUGH 1'
+
+hermes-tui compact /path/to/hermes.sock STREAM_HEX 0 1 0 \
+  'COMPACT HERMES STREAM STREAM_HEX RETAINED FROM 0 PUBLISHED EDGE 1 THROUGH 0'
 ```
