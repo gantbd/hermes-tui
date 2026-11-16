@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use hermes_ledger::{
-    CorrelationId, EventEnvelopeV1, EventSequence, IdempotencyKey, Limits, ProducerId, SchemaId,
-    StreamId, persistence::CheckpointBudgetV1,
+    ConsumerId, CorrelationId, EventEnvelopeV1, EventSequence, IdempotencyKey, Limits, ProducerId,
+    SchemaId, StreamId, persistence::CheckpointBudgetV1,
 };
 
 fn envelope(idempotency: u8, payload: u8) -> EventEnvelopeV1 {
@@ -35,5 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ledger
         .append(stream, Some(EventSequence(0)), envelope(11, 12))
         .map_err(|error| std::io::Error::other(format!("seed failed: {error:?}")))?;
+    ledger
+        .acknowledge(ConsumerId::new([6; 16]), stream, EventSequence(0))
+        .map_err(|error| std::io::Error::other(format!("cursor seed failed: {error:?}")))?;
     Ok(())
 }
