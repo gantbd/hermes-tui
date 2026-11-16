@@ -1,5 +1,9 @@
 # Hermes TUI
 
+Status: locally qualified coordinated source candidate. Public GitHub
+reachability is not claimed until its exact revision and CI run are recorded in
+[`release/github-source.json`](release/github-source.json).
+
 Composable read-only ledger operations presentation over Hermes's public client.
 The `ledger.observe.v1` surface combines status, usage, content-free operational
 signals, optional health for one explicitly configured stream, and optional

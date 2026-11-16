@@ -1,0 +1,11 @@
+.PHONY: check
+
+check:
+	./scripts/check-public-source.sh
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+	cargo test --workspace --all-targets --locked --offline
+	cargo test --workspace --doc --locked --offline
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --offline
+	./tests/live/real_daemon.sh
+	git diff --check
