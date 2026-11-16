@@ -14,7 +14,7 @@ fn reusable_component_is_read_only_and_application_free() {
 
 #[test]
 fn acknowledgement_guard_stays_outside_the_reusable_read_only_component() {
-    let command = include_str!("../consumer-command/src/lib.rs");
+    let command = include_str!("../../hermes/crates/hermes-consumer-command/src/lib.rs");
     let cli = include_str!("../cli/src/main.rs");
     let gate = include_str!("live/real_daemon.sh");
     for required in [
@@ -37,7 +37,7 @@ fn acknowledgement_guard_stays_outside_the_reusable_read_only_component() {
 
 #[test]
 fn compaction_guard_stays_outside_the_reusable_read_only_component() {
-    let command = include_str!("../operator-command/src/lib.rs");
+    let command = include_str!("../../hermes/crates/hermes-operator-command/src/lib.rs");
     let cli = include_str!("../cli/src/main.rs");
     let gate = include_str!("live/real_daemon.sh");
     for required in [
@@ -56,4 +56,25 @@ fn compaction_guard_stays_outside_the_reusable_read_only_component() {
     assert!(cli.contains("hermes_operator_command::compact"));
     assert!(gate.contains("compact-refused"));
     assert!(gate.contains("retained_from"));
+}
+
+#[test]
+fn command_guards_are_owned_by_hermes_not_presentation() {
+    let workspace = include_str!("../Cargo.toml");
+    let cli = include_str!("../cli/Cargo.toml");
+    for command in ["consumer-command", "disclosure-command", "operator-command"] {
+        assert!(!workspace.contains(command));
+        assert!(
+            !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(command)
+                .exists()
+        );
+    }
+    for command in [
+        "../../hermes/crates/hermes-consumer-command",
+        "../../hermes/crates/hermes-disclosure-command",
+        "../../hermes/crates/hermes-operator-command",
+    ] {
+        assert!(cli.contains(command));
+    }
 }

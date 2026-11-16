@@ -13,9 +13,9 @@ doc = false
 
 [dependencies]
 hermes-tui = { path = ".." }
-hermes-consumer-command = { path = "../consumer-command" }
-hermes-disclosure-command = { path = "../disclosure-command" }
-hermes-operator-command = { path = "../operator-command" }
+hermes-consumer-command = { version = "=0.1.0", path = "../../hermes/crates/hermes-consumer-command" }
+hermes-disclosure-command = { version = "=0.1.0", path = "../../hermes/crates/hermes-disclosure-command" }
+hermes-operator-command = { version = "=0.1.0", path = "../../hermes/crates/hermes-operator-command" }
 hermes-tui-local-client = { path = "../local-client" }
 hermes-client = { version = "=0.1.0", path = "../../hermes/crates/hermes-client" }
 hermes-protocol = { version = "=0.1.0", path = "../../hermes/crates/hermes-protocol" }

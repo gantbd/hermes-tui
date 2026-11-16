@@ -22,3 +22,6 @@
    connection. Stale state prevents mutation; uncertain delivery is not
    retried. Add append only with an explicit domain envelope and equally strong
    authorization and uncertainty rules.
+8. Disclosure, consumer, and operator guards now live under Hermes ownership.
+   `hermes-tui` retains only presentation, its local client, and the standalone
+   application shell that invokes those owner contracts.

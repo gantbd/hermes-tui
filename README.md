@@ -15,6 +15,9 @@ Event payloads are available only through the separate
 `DisclosureClient`, requires an exact stream/start/limit confirmation, returns
 at most 16 events, and remains bounded by the negotiated 2 MiB frame ceiling.
 Routine observation never calls this client and remains content-free.
+Disclosure, acknowledgement, and compaction guards are owned by Hermes; this
+repository's standalone shell invokes them without making presentation their
+semantic owner.
 
 Acknowledgement is likewise a separate `ledger.acknowledge.v1` command. It
 observes the exact current cursor, compares it with the operator's expected
