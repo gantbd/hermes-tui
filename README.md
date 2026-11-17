@@ -4,8 +4,8 @@ Status: published through the qualified GitHub source channel at the exact
 revision and CI run recorded in
 [`release/github-source.json`](release/github-source.json).
 
-Composable read-only ledger operations presentation over Hermes's public client.
-The `ledger.observe.v1` surface combines status, usage, content-free operational
+Composable ledger operations presentation over Hermes's public clients. The
+reusable `ledger.observe.v1` component combines status, usage, content-free operational
 signals, optional health for one explicitly configured stream, and optional
 content-free position/backlog for one explicitly configured consumer. It
 neither discovers nor exposes a stream/consumer catalogue nor echoes either
@@ -19,9 +19,18 @@ Event payloads are available only through the separate
 `DisclosureClient`, requires an exact stream/start/limit confirmation, returns
 at most 16 events, and remains bounded by the negotiated 2 MiB frame ceiling.
 Routine observation never calls this client and remains content-free.
-Disclosure, acknowledgement, and compaction guards are owned by Hermes; this
-repository's standalone shell invokes them without making presentation their
-semantic owner.
+Disclosure, acknowledgement, and compaction guards are owned by Hermes. The
+standalone shell invokes all three; isolated composable disclosure and
+acknowledgement sheets also reuse owner guards without making presentation
+their semantic owner.
+
+The composable disclosure sheet proposes a bounded 1–16 event batch from the
+selected stream's retained edge or selected consumer cursor, requires an
+explicit sensitive-content arm/confirm step, and performs one owner-guarded
+read. Results use list/detail navigation and immediately discard full payloads
+after retaining metadata and at most a 256-byte preview per event. Payload
+content never enters routine observation or telemetry, and
+retention/publication gaps remain explicit.
 
 The reusable Unix transport now belongs to the engine-owned
 `hermes-local-client` crate. This repository's `hermes-tui-local-client` crate
@@ -29,17 +38,22 @@ is a compatibility re-export only; new shells, Workbench surfaces, and adapters
 should depend on the owner client directly rather than importing transport from
 a presentation package.
 
-Acknowledgement is likewise a separate `ledger.acknowledge.v1` command. It
-observes the exact current cursor, compares it with the operator's expected
-position, and attempts one exact-confirmed acknowledgement on the same
-connection. A post-send transport failure is outcome-unknown and is never
-retried. The reusable component still does not acquire `ConsumerClient`.
+Acknowledgement is available as both a separate `ledger.acknowledge.v1` command
+and an isolated composable two-step sheet. The sheet selects an exact range
+from the current cursor through any observed published sequence, with
+fine/coarse and bounds navigation. On confirmation it observes the exact
+current cursor, compares it with the operator's expected position, and attempts
+one exact-confirmed acknowledgement on the same connection. A post-send
+transport failure is outcome-unknown and is never retried. The reusable
+component still does not acquire `ConsumerClient`.
 
-Compaction is isolated in `ledger.compact.v1`. Its guard observes the stream's
-retained frontier and published edge, compares both with the operator's exact
-expectation, and then attempts one confirmed compaction on the same connection.
-It never retries an uncertain result, and `OperatorClient` remains outside the
-reusable component.
+Compaction is isolated in `ledger.compact.v1`. Its composable sheet selects any
+exact boundary in the observed retained range, shows the removal count, and
+does not infer consumer safety from aggregate backlog. Its guard observes the
+stream's retained frontier and published edge, compares both with the
+operator's exact expectation, and then attempts one confirmed compaction on
+the same connection. It never retries an uncertain result, and
+`OperatorClient` remains outside the reusable observation component.
 
 Standalone selection is explicit:
 

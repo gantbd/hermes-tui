@@ -1,5 +1,23 @@
-//! Composable, read-only Ratatui presentation over Hermes's public client.
+//! Composable Ratatui observation and isolated guarded control over Hermes public clients.
 #![forbid(unsafe_code)]
+
+mod acknowledge_control;
+mod compaction_control;
+mod disclosure_control;
+
+pub use acknowledge_control::{
+    AcknowledgeComponent, AcknowledgeDisposition, AcknowledgeInput, AcknowledgeSelection,
+    translate_acknowledge_key,
+};
+pub use compaction_control::{
+    CompactionComponent, CompactionDisposition, CompactionInput, CompactionSelection,
+    translate_compaction_key,
+};
+pub use disclosure_control::{
+    DISCLOSURE_BATCH_LIMIT, DisclosureComponent, DisclosureDisposition, DisclosureEventView,
+    DisclosureGapView, DisclosureInput, DisclosureSelection, DisclosureView,
+    translate_disclosure_key,
+};
 
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
@@ -27,7 +45,13 @@ pub struct CapabilityManifest {
 pub const CAPABILITIES: CapabilityManifest = CapabilityManifest {
     schema: 1,
     peer: "hermes",
-    interactive: &["ledger.observe.v1", "ledger.cursor.observe.v1"],
+    interactive: &[
+        "ledger.observe.v1",
+        "ledger.cursor.observe.v1",
+        "ledger.events.disclose.v1",
+        "ledger.acknowledge.v1",
+        "ledger.compact.v1",
+    ],
     headless: &["ledger.observe.v1", "ledger.cursor.observe.v1"],
 };
 
@@ -83,6 +107,8 @@ pub struct Component {
     pending: bool,
     observation: Option<Observation>,
     notice: String,
+    configured_stream: Option<StreamIdV1>,
+    configured_consumer: Option<ConsumerIdV1>,
 }
 
 impl Component {
@@ -133,33 +159,137 @@ impl Component {
             pending: false,
             observation: None,
             notice: "Hermes ready; refresh queued".into(),
+            configured_stream,
+            configured_consumer,
         };
         component.offer();
         component
     }
 
     pub fn poll(&mut self) {
+        let _ = self.poll_settlement();
+    }
+
+    pub fn poll_settlement(&mut self) -> Option<Result<(), ()>> {
+        let mut settlement = None;
         loop {
             match self.replies.try_recv() {
                 Ok(WorkerReply(Ok(value))) => {
                     self.pending = false;
                     self.observation = Some(value);
                     self.notice = "Current ledger observation".into();
+                    settlement = Some(Ok(()));
                 }
                 Ok(WorkerReply(Err(status))) => {
                     self.pending = false;
                     self.notice = status;
+                    settlement = Some(Err(()));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    if self.pending {
+                        settlement = Some(Err(()));
+                    }
                     self.pending = false;
                     self.notice = "Hermes worker unavailable".into();
                     break;
                 }
             }
         }
+        settlement
     }
 
+    pub const fn request_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Proposes one exact, minimal cursor advance from the current projection.
+    /// The owner guard re-observes this cursor on the mutation connection.
+    pub fn next_acknowledgement(&self) -> Option<AcknowledgeSelection> {
+        next_acknowledgement_from(
+            self.observation?,
+            self.configured_stream?,
+            self.configured_consumer?,
+        )
+    }
+
+    /// Proposes a bounded event batch from the selected stream. If a current
+    /// consumer is selected, its cursor is the natural start; otherwise
+    /// disclosure begins at the retained edge reported by the owner.
+    pub fn next_disclosure(&self) -> Option<DisclosureSelection> {
+        next_disclosure_from(self.observation?, self.configured_stream?)
+    }
+
+    /// Proposes an explicit exact-state administrative compaction range.
+    /// The presentation never infers a safe watermark from aggregate consumer
+    /// backlog; the operator must select the destructive boundary.
+    pub fn next_compaction(&self) -> Option<CompactionSelection> {
+        next_compaction_from(self.observation?, self.configured_stream?)
+    }
+}
+
+fn next_compaction_from(
+    observation: Observation,
+    stream: StreamIdV1,
+) -> Option<CompactionSelection> {
+    let ConfiguredStreamObservation::Current(stream_observation) = observation.configured_stream?
+    else {
+        return None;
+    };
+    let published_edge = stream_observation.published_edge?;
+    (stream_observation.retained_from <= published_edge).then_some(CompactionSelection {
+        stream,
+        retained_from: stream_observation.retained_from,
+        published_edge,
+    })
+}
+
+fn next_disclosure_from(
+    observation: Observation,
+    stream: StreamIdV1,
+) -> Option<DisclosureSelection> {
+    let ConfiguredStreamObservation::Current(stream_observation) = observation.configured_stream?
+    else {
+        return None;
+    };
+    let start = match observation.configured_cursor {
+        Some(ConfiguredCursorObservation::Current(cursor)) => cursor.next_sequence,
+        _ => stream_observation.retained_from,
+    };
+    let published_edge = stream_observation.published_edge?;
+    (start <= published_edge).then_some(DisclosureSelection {
+        stream,
+        start,
+        max_events: published_edge
+            .0
+            .saturating_sub(start.0)
+            .saturating_add(1)
+            .min(DISCLOSURE_BATCH_LIMIT),
+    })
+}
+
+fn next_acknowledgement_from(
+    observation: Observation,
+    stream: StreamIdV1,
+    consumer: ConsumerIdV1,
+) -> Option<AcknowledgeSelection> {
+    let ConfiguredCursorObservation::Current(cursor) = observation.configured_cursor? else {
+        return None;
+    };
+    let ConfiguredStreamObservation::Current(stream_observation) = observation.configured_stream?
+    else {
+        return None;
+    };
+    let published_edge = stream_observation.published_edge?;
+    (cursor.next_sequence <= published_edge).then_some(AcknowledgeSelection {
+        consumer,
+        stream,
+        expected_next: cursor.next_sequence,
+        published_edge,
+    })
+}
+
+impl Component {
     pub fn update(&mut self, input: Input, focused: bool) -> Lifecycle {
         if !focused {
             return Lifecycle::Running;
@@ -394,5 +524,101 @@ mod tests {
         let consumer = parse_consumer_id("06060606060606060606060606060606").unwrap();
         assert_eq!(consumer, ConsumerIdV1([6; 16]));
         assert_eq!(format!("{consumer:?}"), "ConsumerIdV1(<opaque>)");
+    }
+
+    #[test]
+    fn range_proposals_use_only_current_available_events() {
+        let stream = StreamIdV1([5; 16]);
+        let consumer = ConsumerIdV1([6; 16]);
+        let usage = UsageV1 {
+            streams: 1,
+            events: 3,
+            idempotency_records: 0,
+            compacted_records: 0,
+            cursors: 1,
+            saturated: false,
+        };
+        let observation = Observation {
+            status: StatusV1 {
+                storage_revision: Some(1),
+                fenced: false,
+            },
+            usage,
+            signals: OperationalSignalsV1 {
+                offers: [0; 5],
+                residence_nanos: [0; 5],
+                domain_refusals: 0,
+                admission_refusals: 0,
+                replays: 0,
+                conflicts: 0,
+                commits: 0,
+                commit_failures: 0,
+                commit_time_nanos: 0,
+                confirmed_usage: usage,
+                last_checkpoint_bytes: 0,
+                fenced: false,
+                saturated: false,
+            },
+            configured_stream: Some(ConfiguredStreamObservation::Current(StreamObservationV1 {
+                retained_from: hermes_protocol::EventSequenceV1(0),
+                published_edge: Some(hermes_protocol::EventSequenceV1(2)),
+                retained_events: 3,
+                consumer_count: 1,
+                stalled_consumers: 0,
+                max_consumer_backlog: 2,
+            })),
+            configured_cursor: Some(ConfiguredCursorObservation::Current(ConsumerCursorV1 {
+                consumer,
+                stream,
+                next_sequence: hermes_protocol::EventSequenceV1(1),
+            })),
+        };
+        assert_eq!(
+            next_acknowledgement_from(observation, stream, consumer),
+            Some(AcknowledgeSelection {
+                consumer,
+                stream,
+                expected_next: hermes_protocol::EventSequenceV1(1),
+                published_edge: hermes_protocol::EventSequenceV1(2),
+            })
+        );
+        let drained = Observation {
+            configured_cursor: Some(ConfiguredCursorObservation::Current(ConsumerCursorV1 {
+                consumer,
+                stream,
+                next_sequence: hermes_protocol::EventSequenceV1(3),
+            })),
+            ..observation
+        };
+        assert_eq!(next_acknowledgement_from(drained, stream, consumer), None);
+        assert_eq!(
+            next_disclosure_from(observation, stream),
+            Some(DisclosureSelection {
+                stream,
+                start: hermes_protocol::EventSequenceV1(1),
+                max_events: 2,
+            })
+        );
+        assert_eq!(next_disclosure_from(drained, stream), None);
+        let without_consumer = Observation {
+            configured_cursor: None,
+            ..observation
+        };
+        assert_eq!(
+            next_disclosure_from(without_consumer, stream),
+            Some(DisclosureSelection {
+                stream,
+                start: hermes_protocol::EventSequenceV1(0),
+                max_events: 3,
+            })
+        );
+        assert_eq!(
+            next_compaction_from(observation, stream),
+            Some(CompactionSelection {
+                stream,
+                retained_from: hermes_protocol::EventSequenceV1(0),
+                published_edge: hermes_protocol::EventSequenceV1(2),
+            })
+        );
     }
 }
