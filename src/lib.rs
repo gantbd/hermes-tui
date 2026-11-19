@@ -22,10 +22,10 @@ pub use disclosure_control::{
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use hermes_client::{ReadOnlyClient, ServicePort};
+use hermes_client::{ConsumerClient, ReadOnlyClient, ServicePort};
 use hermes_protocol::{
-    ConsumerCursorV1, ConsumerIdV1, OperationalSignalsV1, OutcomeV1, ReplyV1, SessionHandleV1,
-    StatusV1, StreamIdV1, StreamObservationV1, UsageV1,
+    ConsumerCursorV1, ConsumerIdV1, EventSequenceV1, OperationalSignalsV1, OutcomeV1, ReadGapV1,
+    ReplyV1, SessionHandleV1, StatusV1, StreamIdV1, StreamObservationV1, UsageV1,
 };
 use ratatui::{
     Frame,
@@ -48,11 +48,16 @@ pub const CAPABILITIES: CapabilityManifest = CapabilityManifest {
     interactive: &[
         "ledger.observe.v1",
         "ledger.cursor.observe.v1",
+        "ledger.consumer.observe.v1",
         "ledger.events.disclose.v1",
         "ledger.acknowledge.v1",
         "ledger.compact.v1",
     ],
-    headless: &["ledger.observe.v1", "ledger.cursor.observe.v1"],
+    headless: &[
+        "ledger.observe.v1",
+        "ledger.cursor.observe.v1",
+        "ledger.consumer.observe.v1",
+    ],
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,13 +104,31 @@ pub enum ConfiguredCursorObservation {
     Current(ConsumerCursorV1),
 }
 
-struct WorkerReply(Result<Observation, String>);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsumerObservation {
+    pub stream: StreamIdV1,
+    pub cursor: Option<ConsumerCursorV1>,
+    pub read_start: EventSequenceV1,
+    pub retained_from: EventSequenceV1,
+    pub published_edge: Option<EventSequenceV1>,
+    pub disclosed_events: u64,
+    pub disclosed_through: Option<EventSequenceV1>,
+    pub gap: Option<ReadGapV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ComponentObservation {
+    Service(Box<Observation>),
+    Consumer(ConsumerObservation),
+}
+
+struct WorkerReply(Result<ComponentObservation, String>);
 
 pub struct Component {
     refresh: SyncSender<()>,
     replies: Receiver<WorkerReply>,
     pending: bool,
-    observation: Option<Observation>,
+    observation: Option<ComponentObservation>,
     notice: String,
     configured_stream: Option<StreamIdV1>,
     configured_consumer: Option<ConsumerIdV1>,
@@ -147,7 +170,9 @@ impl Component {
         std::thread::spawn(move || {
             let mut client = ReadOnlyClient::new(session, port);
             while rx.recv().is_ok() {
-                let result = observe_selected(&mut client, configured_stream, configured_consumer);
+                let result = observe_selected(&mut client, configured_stream, configured_consumer)
+                    .map(Box::new)
+                    .map(ComponentObservation::Service);
                 if reply_tx.send(WorkerReply(result)).is_err() {
                     break;
                 }
@@ -166,6 +191,42 @@ impl Component {
         component
     }
 
+    pub fn new_consumer<P>(
+        session: SessionHandleV1,
+        port: P,
+        stream: StreamIdV1,
+        consumer: ConsumerIdV1,
+        max_read_batch: u64,
+    ) -> Option<Self>
+    where
+        P: ServicePort + Send + 'static,
+        P::Error: Send + 'static,
+    {
+        let (tx, rx) = sync_channel(1);
+        let (reply_tx, reply_rx) = sync_channel(1);
+        let mut client = ConsumerClient::new(session, port, max_read_batch)?;
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                let result = observe_consumer(&mut client, stream, consumer, max_read_batch)
+                    .map(ComponentObservation::Consumer);
+                if reply_tx.send(WorkerReply(result)).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut component = Self {
+            refresh: tx,
+            replies: reply_rx,
+            pending: false,
+            observation: None,
+            notice: "Hermes consumer ready; bounded refresh queued".into(),
+            configured_stream: Some(stream),
+            configured_consumer: Some(consumer),
+        };
+        component.offer();
+        Some(component)
+    }
+
     pub fn poll(&mut self) {
         let _ = self.poll_settlement();
     }
@@ -176,8 +237,12 @@ impl Component {
             match self.replies.try_recv() {
                 Ok(WorkerReply(Ok(value))) => {
                     self.pending = false;
+                    self.notice = match &value {
+                        ComponentObservation::Service(_) => "Current ledger observation",
+                        ComponentObservation::Consumer(_) => "Current bounded consumer observation",
+                    }
+                    .into();
                     self.observation = Some(value);
-                    self.notice = "Current ledger observation".into();
                     settlement = Some(Ok(()));
                 }
                 Ok(WorkerReply(Err(status))) => {
@@ -206,25 +271,52 @@ impl Component {
     /// Proposes one exact, minimal cursor advance from the current projection.
     /// The owner guard re-observes this cursor on the mutation connection.
     pub fn next_acknowledgement(&self) -> Option<AcknowledgeSelection> {
-        next_acknowledgement_from(
-            self.observation?,
-            self.configured_stream?,
-            self.configured_consumer?,
-        )
+        match self.observation.as_ref()? {
+            ComponentObservation::Service(observation) => next_acknowledgement_from(
+                **observation,
+                self.configured_stream?,
+                self.configured_consumer?,
+            ),
+            ComponentObservation::Consumer(observation) => {
+                let cursor = observation.cursor?;
+                let published_edge = observation.disclosed_through?;
+                (cursor.next_sequence <= published_edge).then_some(AcknowledgeSelection {
+                    consumer: cursor.consumer,
+                    stream: observation.stream,
+                    expected_next: cursor.next_sequence,
+                    published_edge,
+                })
+            }
+        }
     }
 
     /// Proposes a bounded event batch from the selected stream. If a current
     /// consumer is selected, its cursor is the natural start; otherwise
     /// disclosure begins at the retained edge reported by the owner.
     pub fn next_disclosure(&self) -> Option<DisclosureSelection> {
-        next_disclosure_from(self.observation?, self.configured_stream?)
+        match self.observation.as_ref()? {
+            ComponentObservation::Service(observation) => {
+                next_disclosure_from(**observation, self.configured_stream?)
+            }
+            ComponentObservation::Consumer(observation) => (observation.disclosed_events > 0)
+                .then_some(DisclosureSelection {
+                    stream: observation.stream,
+                    start: observation.read_start,
+                    max_events: observation.disclosed_events,
+                }),
+        }
     }
 
     /// Proposes an explicit exact-state administrative compaction range.
     /// The presentation never infers a safe watermark from aggregate consumer
     /// backlog; the operator must select the destructive boundary.
     pub fn next_compaction(&self) -> Option<CompactionSelection> {
-        next_compaction_from(self.observation?, self.configured_stream?)
+        match self.observation.as_ref()? {
+            ComponentObservation::Service(observation) => {
+                next_compaction_from(**observation, self.configured_stream?)
+            }
+            ComponentObservation::Consumer(_) => None,
+        }
     }
 }
 
@@ -311,9 +403,15 @@ impl Component {
         } else {
             " Hermes "
         };
-        let lines = self.observation.map_or_else(
+        let lines = self.observation.as_ref().map_or_else(
             || vec![Line::from("No current ledger observation")],
             |value| {
+                let value = match value {
+                    ComponentObservation::Service(value) => value,
+                    ComponentObservation::Consumer(value) => {
+                        return consumer_observation_lines(*value);
+                    }
+                };
                 let mut lines = vec![
                     Line::from(format!(
                         "storage revision: {:?}",
@@ -401,6 +499,44 @@ impl Component {
     }
 }
 
+fn consumer_observation_lines(value: ConsumerObservation) -> Vec<Line<'static>> {
+    vec![
+        Line::from("access: exact-stream consumer"),
+        Line::from("service aggregates: not requested"),
+        Line::from(format!(
+            "retained/published: {}/{}",
+            value.retained_from.0,
+            value
+                .published_edge
+                .map_or_else(|| "none".into(), |edge| edge.0.to_string())
+        )),
+        Line::from(value.cursor.map_or_else(
+            || "configured consumer cursor: absent".into(),
+            |cursor| {
+                format!(
+                    "configured consumer next sequence: {}",
+                    cursor.next_sequence.0
+                )
+            },
+        )),
+        Line::from(format!("bounded read start: {}", value.read_start.0)),
+        Line::from(format!(
+            "bounded events disclosed: {}",
+            value.disclosed_events
+        )),
+        Line::from(format!(
+            "disclosed through: {}",
+            value
+                .disclosed_through
+                .map_or_else(|| "none".into(), |sequence| sequence.0.to_string())
+        )),
+        Line::from(value.gap.map_or_else(
+            || "read gap: none".into(),
+            |gap| format!("read gap: {gap:?}"),
+        )),
+    ]
+}
+
 pub fn observe<P: ServicePort>(client: &mut ReadOnlyClient<P>) -> Result<Observation, String> {
     observe_configured(client, None)
 }
@@ -481,6 +617,44 @@ pub fn observe_selected<P: ServicePort>(
     })
 }
 
+pub fn observe_consumer<P: ServicePort>(
+    client: &mut ConsumerClient<P>,
+    stream: StreamIdV1,
+    consumer: ConsumerIdV1,
+    max_read_batch: u64,
+) -> Result<ConsumerObservation, String> {
+    if max_read_batch == 0 {
+        return Err("Hermes consumer read limit must be positive".into());
+    }
+    let cursor = match client
+        .cursor(consumer, stream)
+        .map_err(|_| "Hermes consumer cursor unavailable")?
+    {
+        ReplyV1::Accepted(OutcomeV1::Cursor(value)) => value,
+        ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
+        _ => return Err("Invalid Hermes consumer cursor reply".into()),
+    };
+    let read_start = cursor.map_or(EventSequenceV1(0), |value| value.next_sequence);
+    let batch = match client
+        .read(stream, read_start, max_read_batch)
+        .map_err(|_| "Hermes consumer read unavailable")?
+    {
+        ReplyV1::Accepted(OutcomeV1::Read(value)) => value,
+        ReplyV1::Refused(value) => return Err(format!("Hermes refused: {value:?}")),
+        _ => return Err("Invalid Hermes consumer read reply".into()),
+    };
+    Ok(ConsumerObservation {
+        stream,
+        cursor,
+        read_start,
+        retained_from: batch.retained_from,
+        published_edge: batch.published_edge,
+        disclosed_events: u64::try_from(batch.events.len()).unwrap_or(u64::MAX),
+        disclosed_through: batch.events.last().map(|event| event.sequence),
+        gap: batch.gap,
+    })
+}
+
 pub fn cursor_backlog(stream: StreamObservationV1, cursor: ConsumerCursorV1) -> u64 {
     stream
         .published_edge
@@ -513,6 +687,27 @@ fn parse_opaque_id(value: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    use hermes_protocol::{CommandV1, ReadBatchV1};
+
+    struct ConsumerPort {
+        replies: VecDeque<ReplyV1>,
+        commands: Vec<CommandV1>,
+    }
+
+    impl ServicePort for ConsumerPort {
+        type Error = ();
+
+        fn execute(
+            &mut self,
+            _session: SessionHandleV1,
+            command: CommandV1,
+        ) -> Result<ReplyV1, Self::Error> {
+            self.commands.push(command);
+            self.replies.pop_front().ok_or(())
+        }
+    }
 
     #[test]
     fn stream_selector_is_exact_and_remains_opaque() {
@@ -524,6 +719,48 @@ mod tests {
         let consumer = parse_consumer_id("06060606060606060606060606060606").unwrap();
         assert_eq!(consumer, ConsumerIdV1([6; 16]));
         assert_eq!(format!("{consumer:?}"), "ConsumerIdV1(<opaque>)");
+    }
+
+    #[test]
+    fn consumer_observation_requests_only_cursor_and_bounded_read() {
+        let stream = StreamIdV1([5; 16]);
+        let consumer = ConsumerIdV1([6; 16]);
+        let cursor = ConsumerCursorV1 {
+            consumer,
+            stream,
+            next_sequence: EventSequenceV1(3),
+        };
+        let port = ConsumerPort {
+            replies: VecDeque::from([
+                ReplyV1::Accepted(OutcomeV1::Cursor(Some(cursor))),
+                ReplyV1::Accepted(OutcomeV1::Read(ReadBatchV1 {
+                    events: Vec::new(),
+                    retained_from: EventSequenceV1(1),
+                    published_edge: Some(EventSequenceV1(2)),
+                    gap: Some(ReadGapV1::AheadOfPublication {
+                        requested: EventSequenceV1(3),
+                        next_sequence: EventSequenceV1(3),
+                    }),
+                })),
+            ]),
+            commands: Vec::new(),
+        };
+        let mut client = ConsumerClient::new(SessionHandleV1(7), port, 4).unwrap();
+        let observed = observe_consumer(&mut client, stream, consumer, 4).unwrap();
+        assert_eq!(observed.cursor, Some(cursor));
+        assert_eq!(observed.read_start, EventSequenceV1(3));
+        assert_eq!(observed.disclosed_events, 0);
+        let port = client.into_port();
+        assert!(matches!(port.commands[0], CommandV1::Cursor { .. }));
+        assert!(matches!(
+            port.commands[1],
+            CommandV1::Read {
+                start: EventSequenceV1(3),
+                limit: 4,
+                ..
+            }
+        ));
+        assert_eq!(port.commands.len(), 2);
     }
 
     #[test]
